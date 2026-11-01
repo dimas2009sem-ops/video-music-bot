@@ -1,12 +1,14 @@
 
 import os
+import re
 import logging
+import tempfile
 import threading
+import subprocess
+from urllib.parse import urlparse
+
 import requests
-
 from flask import Flask, request, jsonify
-
-# ---------------- CONFIG ----------------
 
 logging.basicConfig(level=logging.INFO)
 
@@ -14,173 +16,292 @@ app = Flask(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 AUDD_TOKEN = os.getenv("AUDD_API_TOKEN", "").strip()
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
-REQUEST_TIMEOUT = 60
+MAX_AUDIO_SIZE = 15 * 1024 * 1024
+DOWNLOAD_TIMEOUT = 180
 
-# Храним ожидающие файлы в памяти.
-# После перезапуска Render файл нужно отправить повторно.
 PENDING = {}
 PENDING_LOCK = threading.Lock()
+BUSY = set()
+BUSY_LOCK = threading.Lock()
 
-
-# ---------------- TELEGRAM ----------------
 
 def telegram(method, payload=None):
     if not TOKEN:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в Render")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не настроен")
 
-    response = requests.post(
+    r = requests.post(
         f"{TELEGRAM_API}/{method}",
         json=payload or {},
-        timeout=20
+        timeout=25
     )
+    data = r.json()
 
-    try:
-        data = response.json()
-    except ValueError:
-        response.raise_for_status()
-        raise RuntimeError("Telegram вернул некорректный ответ")
-
-    if not response.ok or not data.get("ok"):
+    if not r.ok or not data.get("ok"):
         raise RuntimeError(
-            f"Telegram API {method}: {data.get('description', response.status_code)}"
+            f"Telegram {method}: {data.get('description', r.status_code)}"
         )
 
     return data.get("result")
 
 
 def send_text(chat_id, text, reply_markup=None):
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
-
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-
     return telegram("sendMessage", payload)
 
 
-def main_keyboard():
+def keyboard():
     return {
         "inline_keyboard": [[
-            {
-                "text": "🎵 Распознать музыку",
-                "callback_data": "recognize"
-            }
+            {"text": "🎵 Распознать музыку", "callback_data": "recognize"}
         ]]
     }
 
 
-# ---------------- MUSIC RECOGNITION ----------------
-
 def recognize_audio(audio_bytes, filename):
     if not AUDD_TOKEN:
-        raise RuntimeError("Не задан AUDD_API_TOKEN в Render")
+        raise RuntimeError("AUDD_API_TOKEN не настроен в Render")
 
-    response = requests.post(
+    r = requests.post(
         "https://api.audd.io/",
         data={
             "api_token": AUDD_TOKEN,
             "return": "spotify,apple_music"
         },
         files={
-            "file": (
-                filename,
-                audio_bytes,
-                "application/octet-stream"
-            )
+            "file": (filename, audio_bytes, "application/octet-stream")
         },
-        timeout=REQUEST_TIMEOUT
+        timeout=90
     )
-
-    response.raise_for_status()
-    data = response.json()
+    r.raise_for_status()
+    data = r.json()
 
     if data.get("status") != "success":
-        logging.error("AudD error: %s", data)
-        return (
-            "❌ Сервис распознавания не смог обработать файл.\n"
-            "Попробуй другое видео или аудиофайл."
-        )
+        logging.error("AudD response: %s", data)
+        return "❌ AudD не смог обработать звук. Попробуй другой файл."
 
     result = data.get("result")
-
     if not result:
         return (
-            "🔎 Не удалось определить песню.\n"
-            "Попробуй отправить видео с более чётким звуком."
+            "🔎 Песня не найдена. Попробуй другое видео "
+            "или фрагмент, где музыка слышна отчётливо."
         )
-
-    title = result.get("title") or "Неизвестное название"
-    artist = result.get("artist") or "Неизвестный исполнитель"
 
     lines = [
         "🎵 Музыка найдена!",
         "",
-        f"🎶 Название: {title}",
-        f"🎤 Исполнитель: {artist}"
+        f"🎶 Название: {result.get('title', 'Неизвестно')}",
+        f"🎤 Исполнитель: {result.get('artist', 'Неизвестен')}"
     ]
 
-    album = result.get("album")
-    if album:
-        lines.append(f"💿 Альбом: {album}")
-
-    release_date = result.get("release_date")
-    if release_date:
-        lines.append(f"📅 Дата выхода: {release_date}")
+    if result.get("album"):
+        lines.append(f"💿 Альбом: {result['album']}")
+    if result.get("release_date"):
+        lines.append(f"📅 Дата выхода: {result['release_date']}")
 
     spotify = result.get("spotify") or {}
-    spotify_url = spotify.get("external_urls", {}).get("spotify")
+    spotify_url = (spotify.get("external_urls") or {}).get("spotify")
     if spotify_url:
         lines.append(f"🟢 Spotify: {spotify_url}")
 
-    apple_music = result.get("apple_music") or {}
-    apple_url = apple_music.get("url")
-    if apple_url:
-        lines.append(f"🍎 Apple Music: {apple_url}")
+    apple = result.get("apple_music") or {}
+    if apple.get("url"):
+        lines.append(f"🍎 Apple Music: {apple['url']}")
 
     return "\n".join(lines)
 
 
-# ---------------- DOWNLOAD FROM TELEGRAM ----------------
+def download_telegram_file(file_id):
+    info = telegram("getFile", {"file_id": file_id})
+    path = info.get("file_path")
 
-def get_file_bytes(file_id):
-    result = telegram("getFile", {"file_id": file_id})
-    file_path = result.get("file_path")
+    if not path:
+        raise RuntimeError("Telegram не предоставил путь к файлу")
 
-    if not file_path:
-        raise RuntimeError("Telegram не вернул путь к файлу")
+    if info.get("file_size", 0) > MAX_FILE_SIZE:
+        raise RuntimeError("Файл больше 20 МБ")
 
-    file_size = result.get("file_size", 0)
+    r = requests.get(
+        f"https://api.telegram.org/file/bot{TOKEN}/{path}",
+        timeout=60
+    )
+    r.raise_for_status()
 
-    if file_size and file_size > MAX_FILE_SIZE:
-        raise RuntimeError("Файл превышает допустимый размер 20 МБ")
+    if len(r.content) > MAX_FILE_SIZE:
+        raise RuntimeError("Файл больше 20 МБ")
 
-    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-
-    response = requests.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-
-    content = response.content
-
-    if len(content) > MAX_FILE_SIZE:
-        raise RuntimeError("Файл превышает допустимый размер 20 МБ")
-
-    filename = file_path.rsplit("/", 1)[-1] or "audio.bin"
-
-    return content, filename
+    return r.content, os.path.basename(path) or "audio.bin"
 
 
-# ---------------- MESSAGE HANDLER ----------------
+def validate_video_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Пришли полную ссылку, начинающуюся с https://")
+
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtu.be"
+        or host == "tiktok.com"
+        or host.endswith(".tiktok.com")
+        or host == "instagram.com"
+        or host.endswith(".instagram.com")
+        or host == "facebook.com"
+        or host.endswith(".facebook.com")
+        or host == "fb.watch"
+        or host == "x.com"
+        or host.endswith(".x.com")
+        or host == "twitter.com"
+        or host.endswith(".twitter.com")
+        or host == "vimeo.com"
+        or host.endswith(".vimeo.com")
+    )
+
+    if not allowed:
+        raise ValueError(
+            "Пока поддерживаются ссылки YouTube, TikTok, Instagram, "
+            "Facebook, X/Twitter и Vimeo."
+        )
+
+    return url
+
+
+def download_audio_from_url(url):
+    validate_video_url(url)
+
+    # Загружаем только аудио. Ограничиваем размер и время обработки.
+    with tempfile.TemporaryDirectory() as tmp:
+        output_template = os.path.join(tmp, "audio.%(ext)s")
+
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout", "20",
+            "--retries", "1",
+            "--max-filesize", "100M",
+            "-f", "bestaudio/best",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "5",
+            "-o", output_template,
+            url
+        ]
+
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=DOWNLOAD_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "Скачивание заняло слишком много времени. Попробуй другую ссылку."
+            )
+
+        if process.returncode != 0:
+            logging.warning("yt-dlp failed: %s", process.stderr[-2500:])
+            raise RuntimeError(
+                "Не получилось скачать видео по этой ссылке. "
+                "Возможно, оно приватное, сайт требует авторизацию "
+                "или ссылка больше не работает."
+            )
+
+        files = [
+            os.path.join(tmp, name)
+            for name in os.listdir(tmp)
+            if os.path.isfile(os.path.join(tmp, name))
+        ]
+
+        if not files:
+            raise RuntimeError("Загрузчик не создал аудиофайл")
+
+        audio_path = max(files, key=os.path.getsize)
+        size = os.path.getsize(audio_path)
+
+        if size == 0:
+            raise RuntimeError("Получился пустой аудиофайл")
+
+        if size > MAX_AUDIO_SIZE:
+            raise RuntimeError(
+                "Аудио слишком длинное или большое. Попробуй короткий ролик."
+            )
+
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+
+        return audio_bytes, "music.mp3"
+
+
+def process_file(chat_id, file_id):
+    send_text(chat_id, "⏳ Загружаю файл и распознаю музыку...")
+    content, filename = download_telegram_file(file_id)
+    send_text(chat_id, recognize_audio(content, filename))
+
+
+def process_url(chat_id, url):
+    send_text(
+        chat_id,
+        "⏳ Получил ссылку. Скачиваю аудио из видео — это может занять минуту..."
+    )
+    content, filename = download_audio_from_url(url)
+    send_text(chat_id, recognize_audio(content, filename))
+
+
+def run_job(chat_id, job, value):
+    with BUSY_LOCK:
+        if chat_id in BUSY:
+            send_text(
+                chat_id,
+                "⌛ Я уже обрабатываю твой предыдущий запрос. Подожди немного."
+            )
+            return
+        BUSY.add(chat_id)
+
+    try:
+        if job == "url":
+            process_url(chat_id, value)
+        else:
+            process_file(chat_id, value)
+
+    except Exception as e:
+        logging.exception("Recognition job failed")
+
+        message = str(e)
+        if "AUDD_API_TOKEN" in message:
+            answer = (
+                "❌ Не настроен AUDD_API_TOKEN. "
+                "Проверь переменные в Render → Environment."
+            )
+        elif "20 МБ" in message or "слишком длинное" in message:
+            answer = f"❌ {message}"
+        elif "поддерживаются ссылки" in message or "https://" in message:
+            answer = f"❌ {message}"
+        else:
+            answer = (
+                "❌ Не удалось распознать музыку.\n\n"
+                "Проверь доступность ссылки и настройки AudD. "
+                "Если ошибка повторится, посмотри Render Logs."
+            )
+
+        try:
+            send_text(chat_id, answer)
+        except Exception:
+            logging.exception("Failed to send error to Telegram")
+
+    finally:
+        with BUSY_LOCK:
+            BUSY.discard(chat_id)
+
 
 def handle_message(message):
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-
+    chat_id = (message.get("chat") or {}).get("id")
     if not chat_id:
         return
 
@@ -189,23 +310,42 @@ def handle_message(message):
     if text.startswith("/start"):
         send_text(
             chat_id,
-            "Привет! 🎵 Я помогу найти музыку в видео или аудио.\n\n"
-            "1. Отправь видео, аудио или музыкальный файл прямо в чат.\n"
-            "2. Дождись сообщения о принятом файле.\n"
-            "3. Нажми кнопку «🎵 Распознать музыку» под этим сообщением.\n\n"
-            "⚠️ Ссылки на видео пока не обрабатываются — отправляй сам файл.",
-            reply_markup=main_keyboard()
+            "Привет! 🎵 Я ищу музыку в видео.\n\n"
+            "Можно:\n"
+            "• отправить видео или аудио как файл;\n"
+            "• прислать публичную ссылку на YouTube, TikTok, "
+            "Instagram и некоторые другие платформы.\n\n"
+            "Отправь файл или ссылку и нажми кнопку распознавания.",
+            reply_markup=keyboard()
         )
         return
 
     if text.startswith("/help"):
         send_text(
             chat_id,
-            "🎵 Как распознать музыку:\n\n"
-            "1. Отправь видео, аудио или документ с музыкой.\n"
-            "2. Нажми кнопку под ответом о принятом файле.\n"
-            "3. Дождись названия песни и исполнителя.\n\n"
-            "Если не получилось, попробуй файл меньшего размера."
+            "🎵 Отправь видео/аудиофайл или публичную ссылку на видео. "
+            "Затем нажми «Распознать музыку» под ответом бота."
+        )
+        return
+
+    # Ссылку обрабатываем как запрос, а не как файл.
+    urls = re.findall(r"https?://[^\s<>]+", text)
+    if urls:
+        url = urls[0].rstrip(".,!?)]}»")
+        try:
+            validate_video_url(url)
+        except ValueError as e:
+            send_text(chat_id, f"❌ {e}")
+            return
+
+        with PENDING_LOCK:
+            PENDING[chat_id] = {"type": "url", "value": url}
+
+        send_text(
+            chat_id,
+            "✅ Ссылка получена!\n\n"
+            "Нажми кнопку, чтобы скачать звук и найти песню.",
+            reply_markup=keyboard()
         )
         return
 
@@ -215,115 +355,75 @@ def handle_message(message):
         or message.get("voice")
         or message.get("document")
         or message.get("animation")
+        or message.get("video_note")
     )
 
-    if not media:
-        if text:
-            send_text(
-                chat_id,
-                "Отправь видео или аудиофайл как файл или медиа, "
-                "а затем нажми кнопку распознавания."
-            )
-        return
+    if media:
+        file_id = media.get("file_id")
+        size = media.get("file_size", 0)
 
-    file_id = media.get("file_id")
-    file_size = media.get("file_size", 0)
+        if not file_id:
+            send_text(chat_id, "❌ Не удалось получить файл. Отправь его ещё раз.")
+            return
 
-    if not file_id:
-        send_text(chat_id, "❌ Не удалось получить файл. Отправь его ещё раз.")
-        return
+        if size and size > MAX_FILE_SIZE:
+            send_text(chat_id, "❌ Файл слишком большой. Максимум 20 МБ.")
+            return
 
-    if file_size and file_size > MAX_FILE_SIZE:
+        with PENDING_LOCK:
+            PENDING[chat_id] = {"type": "file", "value": file_id}
+
         send_text(
             chat_id,
-            "❌ Файл слишком большой. Максимальный размер — 20 МБ."
+            "✅ Файл получен! Нажми кнопку ниже для распознавания.",
+            reply_markup=keyboard()
         )
         return
 
-    with PENDING_LOCK:
-        PENDING[chat_id] = file_id
+    if text:
+        send_text(
+            chat_id,
+            "Отправь видео, аудио или ссылку на видео с поддерживаемого сайта."
+        )
 
-    send_text(
-        chat_id,
-        "✅ Файл получен!\n\n"
-        "Нажми кнопку ниже, и я попробую определить песню.",
-        reply_markup=main_keyboard()
-    )
-
-
-# ---------------- BUTTON HANDLER ----------------
 
 def handle_callback(callback):
     callback_id = callback.get("id")
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
-    data = callback.get("data")
 
-    # Если Telegram не смог подтвердить нажатие,
-    # продолжаем обработку кнопки.
     try:
         telegram(
             "answerCallbackQuery",
             {
                 "callback_query_id": callback_id,
-                "text": "Проверяю музыку..."
+                "text": "Начинаю распознавание..."
             }
         )
     except Exception:
-        logging.exception("answerCallbackQuery failed")
+        logging.warning("Could not answer callback query", exc_info=True)
 
-    if data != "recognize" or not chat_id:
+    if not chat_id or callback.get("data") != "recognize":
         return
 
     with PENDING_LOCK:
-        file_id = PENDING.get(chat_id)
+        item = PENDING.get(chat_id)
 
-    if not file_id:
+    if not item:
         send_text(
             chat_id,
-            "Сначала отправь видео или аудиофайл отдельным сообщением. "
-            "Затем нажми кнопку под ответом «Файл получен!»."
+            "Сначала отправь видео, аудио или ссылку, "
+            "затем нажми кнопку под сообщением «получено»."
         )
         return
 
-    send_text(chat_id, "⏳ Загружаю файл и ищу песню...")
+    run_job(chat_id, item["type"], item["value"])
 
-    try:
-        content, filename = get_file_bytes(file_id)
-        result = recognize_audio(content, filename)
-        send_text(chat_id, result)
-
-        with PENDING_LOCK:
+    # Удаляем запрос только после завершения обработки.
+    with PENDING_LOCK:
+        if PENDING.get(chat_id) == item:
             PENDING.pop(chat_id, None)
 
-    except Exception as error:
-        logging.exception("Music recognition failed: %s", error)
-
-        error_text = str(error).lower()
-
-        if "20 мб" in error_text or "too big" in error_text:
-            message_text = (
-                "❌ Файл слишком большой. Попробуй файл размером до 20 МБ."
-            )
-        elif "audd_api_token" in error_text:
-            message_text = (
-                "❌ Не настроен AudD. Проверь переменную AUDD_API_TOKEN "
-                "в Render → Environment."
-            )
-        else:
-            message_text = (
-                "❌ Не удалось распознать файл.\n\n"
-                "Проверь, что AUDD_API_TOKEN в Render правильный, "
-                "и попробуй другое видео или аудио."
-            )
-
-        try:
-            send_text(chat_id, message_text)
-        except Exception:
-            logging.exception("Could not send error message")
-
-
-# ---------------- FLASK ROUTES ----------------
 
 @app.route("/", methods=["GET"])
 def index():
@@ -343,36 +443,25 @@ def webhook():
     update = request.get_json(silent=True) or {}
 
     logging.info(
-        "Telegram update received: %s",
-        {
-            "update_id": update.get("update_id"),
-            "has_message": "message" in update,
-            "has_callback": "callback_query" in update
-        }
+        "Telegram update received: update_id=%s message=%s callback=%s",
+        update.get("update_id"),
+        "message" in update,
+        "callback_query" in update
     )
 
     try:
         if "message" in update:
             handle_message(update["message"])
-
         elif "callback_query" in update:
             handle_callback(update["callback_query"])
-
     except Exception:
         logging.exception("Webhook processing failed")
 
-    # Telegram должен получить HTTP 200, чтобы не повторять update.
     return jsonify({"ok": True}), 200
 
 
 @app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    if not TOKEN:
-        return jsonify({
-            "ok": False,
-            "error": "TELEGRAM_BOT_TOKEN is not configured"
-        }), 500
-
     base_url = os.getenv(
         "RENDER_EXTERNAL_URL",
         "https://video-music-bot.onrender.com"
@@ -384,20 +473,15 @@ def set_webhook():
             {"url": f"{base_url}/webhook"}
         )
         return jsonify({"ok": True, "result": result})
-
     except Exception:
-        logging.exception("Could not set webhook")
-        return jsonify({
-            "ok": False,
-            "error": "Не удалось установить webhook. Проверь Render Logs."
-        }), 500
+        logging.exception("Webhook setup failed")
+        return jsonify({"ok": False, "error": "Webhook setup failed"}), 500
 
 
 @app.route("/webhook-info", methods=["GET"])
 def webhook_info():
     try:
         result = telegram("getWebhookInfo")
-        # Не возвращаем URL с токеном или секретные данные.
         return jsonify({
             "ok": True,
             "url": result.get("url"),
@@ -405,16 +489,10 @@ def webhook_info():
             "last_error_date": result.get("last_error_date"),
             "last_error_message": result.get("last_error_message")
         })
-
     except Exception:
-        logging.exception("Could not get webhook info")
-        return jsonify({
-            "ok": False,
-            "error": "Не удалось получить статус webhook"
-        }), 500
+        logging.exception("Webhook info failed")
+        return jsonify({"ok": False, "error": "Could not get webhook info"}), 500
 
-
-# ---------------- START ----------------
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
